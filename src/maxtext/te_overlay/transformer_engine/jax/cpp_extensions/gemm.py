@@ -104,6 +104,40 @@ def sanitize_dims(ndim: int, dims: Union[int, Sequence[int]]) -> Sequence[int]:
     return tuple(ndim + dim if dim < 0 else dim for dim in dims_ if dim is not None)
 
 
+def _spec_axes(spec):
+    """Normalize one PartitionSpec entry to an ordered tuple of mesh axes."""
+    if spec is None:
+        return ()
+    axes = spec if isinstance(spec, tuple) else (spec,)
+    return tuple(dict.fromkeys(axes))
+
+
+def _axes_spec(axes):
+    """Convert normalized mesh axes back to one PartitionSpec entry."""
+    axes = tuple(axes)
+    if not axes:
+        return None
+    return axes[0] if len(axes) == 1 else axes
+
+
+def _intersect_spec_axes(spec, other_spec):
+    """Return the ordered mesh axes shared by two PartitionSpec entries."""
+    other_axes = set(_spec_axes(other_spec))
+    return _axes_spec(axis for axis in _spec_axes(spec) if axis in other_axes)
+
+
+def _shared_contracting_spec(lhs_cspecs, rhs_cspecs):
+    """Find the shared mesh axes for the single sharded contracting dimension."""
+    reduce_spec = None
+    for lhs_cspec, rhs_cspec in zip(lhs_cspecs, rhs_cspecs):
+        shared_spec = _intersect_spec_axes(lhs_cspec, rhs_cspec)
+        if shared_spec is not None:
+            if reduce_spec is not None:
+                raise RuntimeError("Multiple reduce dimension is detected!")
+            reduce_spec = shared_spec
+    return reduce_spec
+
+
 def _subtract_spec_axes(spec, other_specs):
     """Remove mesh axes present in other specs while preserving partial compounds."""
     if spec is None:
@@ -112,14 +146,9 @@ def _subtract_spec_axes(spec, other_specs):
         axis
         for other_spec in other_specs
         if other_spec is not None
-        for axis in (other_spec if isinstance(other_spec, tuple) else (other_spec,))
+        for axis in _spec_axes(other_spec)
     }
-    remaining = tuple(
-        axis for axis in (spec if isinstance(spec, tuple) else (spec,)) if axis not in other_axes
-    )
-    if not remaining:
-        return None
-    return remaining[0] if len(remaining) == 1 else remaining
+    return _axes_spec(axis for axis in _spec_axes(spec) if axis not in other_axes)
 
 
 def get_non_contracting_dims(ndim, contracting_dims):
@@ -906,6 +935,8 @@ class GemmPrimitive(BasePrimitive):
         scaling_mode,
     ):
         lhs_specs, _, rhs_specs, *_ = map(get_padded_spec, arg_infos)
+        original_lhs_specs = lhs_specs
+        original_rhs_specs = rhs_specs
 
         gsr = global_mesh_resource()
 
@@ -931,13 +962,18 @@ class GemmPrimitive(BasePrimitive):
             (lhs_non_cdims, lhs_cdims, rhs_non_cdims, rhs_cdims),
         )
 
-        reduce_spec = None
-        for l in lhs_cspecs:
-            for r in rhs_cspecs:
-                if l is not None and l == r:
-                    if reduce_spec is not None:
-                        raise RuntimeError("Multiple reduce dimension is detected!")
-                    reduce_spec = l
+        if collective_op.is_none:
+            reduce_spec = _shared_contracting_spec(lhs_cspecs, rhs_cspecs)
+        else:
+            # Preserve CollectiveGEMM AG/RS behavior. The shared-axis
+            # intersection is needed only for the non-collective WGrad path.
+            reduce_spec = None
+            for lhs_cspec in lhs_cspecs:
+                for rhs_cspec in rhs_cspecs:
+                    if lhs_cspec is not None and lhs_cspec == rhs_cspec:
+                        if reduce_spec is not None:
+                            raise RuntimeError("Multiple reduce dimension is detected!")
+                        reduce_spec = lhs_cspec
 
         sequence_dim = None
 
@@ -970,14 +1006,19 @@ class GemmPrimitive(BasePrimitive):
 
         if reduce_spec is not None:
             # Other non-reduce cdims (if exists) need to be unsharded
-            lhs_cspecs = tuple(s if s == reduce_spec else None for s in lhs_cspecs)
-            # Only do AG Sequence dim if not Overlap
-            if collective_op.is_all_gather:
-                rhs_cspecs = tuple(
-                    s if s in (reduce_spec, gsr.tpsp_resource) else None for s in rhs_cspecs
-                )
+            if collective_op.is_none:
+                lhs_cspecs = tuple(_intersect_spec_axes(s, reduce_spec) for s in lhs_cspecs)
+                rhs_cspecs = tuple(_intersect_spec_axes(s, reduce_spec) for s in rhs_cspecs)
             else:
-                rhs_cspecs = tuple(s if s == reduce_spec else None for s in rhs_cspecs)
+                lhs_cspecs = tuple(s if s == reduce_spec else None for s in lhs_cspecs)
+                # Only do AG Sequence dim if not Overlap
+                if collective_op.is_all_gather:
+                    rhs_cspecs = tuple(
+                        s if s in (reduce_spec, gsr.tpsp_resource) else None
+                        for s in rhs_cspecs
+                    )
+                else:
+                    rhs_cspecs = tuple(s if s == reduce_spec else None for s in rhs_cspecs)
 
             # Non-contracting dims of RHS always needs to be gathered, i.e. for TP + activation_hidden
             # No batch-dim check needed as `rhs_non_cspecs` never contains batch-dim.
@@ -1071,6 +1112,30 @@ class GemmPrimitive(BasePrimitive):
         if not collective_op.is_none:
             if sequence_dim < 0:
                 raise ValueError(f"Invalid sequence_dim. Got sequence_dim={sequence_dim}")
+
+        if os.getenv("NVTE_JAX_DEBUG_GEMM_SPECS") == "1":
+            mesh_resource_roles = {
+                role: getattr(gsr, role)
+                for role in (
+                    "dp_resource",
+                    "tp_resource",
+                    "tpsp_resource",
+                    "fsdp_resource",
+                    "pp_resource",
+                    "cp_resource",
+                    "ep_resource",
+                )
+            }
+            print(
+                "[NVTE_JAX_DEBUG_GEMM_SPECS] "
+                f"operand_global_shapes={tuple(tuple(info.shape) for info in arg_infos)} "
+                f"lhs_specs={original_lhs_specs} rhs_specs={original_rhs_specs} "
+                f"contracting_dimensions={contracting_dims} "
+                f"mesh_resource_roles={mesh_resource_roles} reduce_spec={reduce_spec} "
+                f"inferred_input_specs={(lhs_specs, lhs_scale_specs, rhs_specs, rhs_scale_specs, bias_specs)} "
+                f"inferred_output_specs={out_specs}",
+                flush=True,
+            )
 
         return (
             (lhs_specs, lhs_scale_specs, rhs_specs, rhs_scale_specs, bias_specs),
