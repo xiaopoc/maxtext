@@ -179,6 +179,20 @@ def test_compound_te_ep_supports_outer_fsdp():
   assert config.ici_fsdp_parallelism == 2
 
 
+def test_te_bf16_wgrad_requires_fp8_dense_quantization():
+  config = _compound_te_ep_config(
+      quantization="te_fp8_currentscaling",
+      te_wgrad_precision="bf16",
+  )
+  assert config.te_wgrad_precision == pydantic_types.TEWgradPrecisionType.BF16
+
+  with pytest.raises(ValueError, match="te_wgrad_precision=bf16 requires"):
+    _compound_te_ep_config(
+        quantization="",
+        te_wgrad_precision="bf16",
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

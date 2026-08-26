@@ -1366,6 +1366,7 @@ def _te_gemm(
     lhs_quantizer: Quantizer = None,
     rhs_quantizer: Quantizer = None,
     contracting_dims: Tuple[Sequence[int], Sequence[int]] = ((-1,), (0,)),
+    preferred_element_type: jnp.dtype = None,
     use_split_accumulator: bool = False,
     transpose_batch_sequence: bool = False,
     collective_op: CollectiveOp = CollectiveOp.NONE,
@@ -1441,7 +1442,15 @@ def _te_gemm(
             " DELAYED_TENSOR_SCALING, CURRENT_TENSOR_SCALING, and MXFP8_1D_SCALING are supported."
         )
 
-    out_dtype = lhs_q.dq_dtype if isinstance(lhs_q, ScaledTensor) else lhs_data.dtype
+    if preferred_element_type is not None and isinstance(lhs_q, ScaledTensor):
+        raise ValueError(
+            "preferred_element_type is supported only for non-quantized GEMM operands."
+        )
+    out_dtype = (
+        preferred_element_type
+        if preferred_element_type is not None
+        else lhs_q.dq_dtype if isinstance(lhs_q, ScaledTensor) else lhs_data.dtype
+    )
     if bias is None:
         bias = jnp.empty(0, dtype=out_dtype)
 
@@ -2020,6 +2029,7 @@ def _jax_gemm(
     contracting_dims: Tuple[Sequence[int], Sequence[int]] = ((1,), (0,)),
     lhs_quantizer: Quantizer = None,
     rhs_quantizer: Quantizer = None,
+    preferred_element_type: jnp.dtype = None,
     use_split_accumulator: bool = False,
 ) -> jnp.ndarray:
     """
@@ -2055,7 +2065,12 @@ def _jax_gemm(
         and lhs_quantizer is None
         and rhs_quantizer is None
     ):
-        return jax.lax.dot_general(lhs, rhs, dim_nums, preferred_element_type=lhs.dtype)
+        return jax.lax.dot_general(
+            lhs,
+            rhs,
+            dim_nums,
+            preferred_element_type=preferred_element_type or lhs.dtype,
+        )
 
     raise NotImplementedError("Not supporting multiplication of ScaledTensor and jnp.array")
 
@@ -2069,6 +2084,7 @@ def gemm(
     rhs_quantizer: Quantizer = None,
     transpose_batch_sequence: bool = False,
     collective_op: CollectiveOp = CollectiveOp.NONE,
+    preferred_element_type: jnp.dtype = None,
     **kwargs,
 ) -> Tuple[jnp.ndarray, ...]:
     r"""General matrix multiplication with optional quantization.
@@ -2095,6 +2111,10 @@ def gemm(
         ``CollectiveOp.ALL_GATHER`` or ``CollectiveOp.REDUCE_SCATTER``, the GEMM
         is executed with communication overlap via the Userbuffers or cuBLASMp
         backend (see :func:`collective_gemm_bootstrap`).
+    preferred_element_type: jnp.dtype, default = None
+        Optional output dtype for non-quantized GEMMs. This is used by the
+        higher-precision Dense WGrad path to keep local output and distributed
+        reduction in FP32 before the final gradient cast.
 
         .. note::
             Collective GEMM with communication overlap is captured into XLA
@@ -2139,7 +2159,13 @@ def gemm(
         if not collective_op.is_none:
             raise RuntimeError("JAX GEMM does not support collective GEMM")
         output = _jax_gemm(
-            lhs, rhs, contracting_dims, lhs_quantizer, rhs_quantizer, use_split_accumulator
+            lhs,
+            rhs,
+            contracting_dims,
+            lhs_quantizer,
+            rhs_quantizer,
+            preferred_element_type,
+            use_split_accumulator,
         )
         if bias is not None:
             output += bias  # Unfused
@@ -2152,6 +2178,7 @@ def gemm(
         lhs_quantizer=lhs_quantizer,
         rhs_quantizer=rhs_quantizer,
         contracting_dims=contracting_dims,
+        preferred_element_type=preferred_element_type,
         use_split_accumulator=use_split_accumulator,
         transpose_batch_sequence=transpose_batch_sequence,
         collective_op=collective_op,
