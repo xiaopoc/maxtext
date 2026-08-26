@@ -138,6 +138,35 @@ def _shared_contracting_spec(lhs_cspecs, rhs_cspecs):
     return reduce_spec
 
 
+def _infer_contracting_reduction_spec(
+    lhs_cspecs, rhs_cspecs, lhs_non_cspecs, rhs_non_cspecs
+):
+    """Infer WGrad reduction axes independent of contracting-dimension order."""
+    rhs_contracting_axes = {
+        axis for spec in rhs_cspecs for axis in _spec_axes(spec)
+    }
+    shared_contracting_axes = tuple(
+        dict.fromkeys(
+            axis
+            for spec in lhs_cspecs
+            for axis in _spec_axes(spec)
+            if axis in rhs_contracting_axes
+        )
+    )
+    output_axes = {
+        axis
+        for spec in (*lhs_non_cspecs, *rhs_non_cspecs)
+        for axis in _spec_axes(spec)
+    }
+    # An axis that also shards a non-contracting/output dimension cannot be
+    # all-reduced without destroying the kernel shard. Leave that axis to the
+    # existing operand resharding path and reduce only replicated output axes.
+    reduction_axes = tuple(
+        axis for axis in shared_contracting_axes if axis not in output_axes
+    )
+    return _axes_spec(reduction_axes)
+
+
 def _subtract_spec_axes(spec, other_specs):
     """Remove mesh axes present in other specs while preserving partial compounds."""
     if spec is None:
@@ -538,7 +567,7 @@ class GemmPrimitive(BasePrimitive):
 
     name = "te_gemm_v2_ffi"
     multiple_results = True
-    impl_static_args = (7, 8, 9, 10, 11, 12, 13, 14)
+    impl_static_args = (7, 8, 9, 10, 11, 12, 13, 14, 15)
     inner_primitive = None
     outer_primitive = None
 
@@ -559,8 +588,9 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
     ):
-        del use_split_accumulator, transpose_batch_sequence
+        del use_split_accumulator, transpose_batch_sequence, infer_contracting_reduction_axes
 
         def _dims_are_consecutive(dims):
             if len(dims) <= 1:
@@ -719,8 +749,15 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
     ):
-        del out_dtype, transpose_batch_sequence, sequence_dim, is_outer
+        del (
+            out_dtype,
+            transpose_batch_sequence,
+            sequence_dim,
+            is_outer,
+            infer_contracting_reduction_axes,
+        )
 
         lhs_aval, _, rhs_aval, *_ = ctx.avals_in
         lhs_cdims, rhs_cdims = map(sanitize_dims, (lhs_aval.ndim, rhs_aval.ndim), contracting_dims)
@@ -758,6 +795,7 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
     ):
         if scaling_mode.is_1d_block_scaling():
             lhs_cdims, rhs_cdims = map(sanitize_dims, (lhs.ndim, rhs.ndim), contracting_dims)
@@ -842,6 +880,7 @@ class GemmPrimitive(BasePrimitive):
             sequence_dim=sequence_dim,
             is_outer=is_outer,
             collective_op=collective_op,
+            infer_contracting_reduction_axes=infer_contracting_reduction_axes,
         )
         # Alter output blocks for CGEMM AG
         if need_reorder and collective_op.is_all_gather and output.shape[0] != 1:
@@ -867,6 +906,7 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
     ):
         return GemmPrimitive.impl(
             lhs,
@@ -884,6 +924,7 @@ class GemmPrimitive(BasePrimitive):
             sequence_dim,
             is_outer,
             collective_op,
+            infer_contracting_reduction_axes,
         )
 
     @staticmethod
@@ -898,6 +939,7 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
     ):
         del transpose_batch_sequence, sequence_dim, is_outer
         if GemmPrimitive.outer_primitive is None:
@@ -922,6 +964,7 @@ class GemmPrimitive(BasePrimitive):
                 transpose_batch_sequence=transpose_batch_sequence,
                 sequence_dim=sequence_dim,
                 is_outer=is_outer,
+                infer_contracting_reduction_axes=infer_contracting_reduction_axes,
             ),
             (out_bdims,),
         )
@@ -933,6 +976,7 @@ class GemmPrimitive(BasePrimitive):
         transpose_batch_sequence,
         collective_op,
         scaling_mode,
+        infer_contracting_reduction_axes=False,
     ):
         lhs_specs, _, rhs_specs, *_ = map(get_padded_spec, arg_infos)
         original_lhs_specs = lhs_specs
@@ -962,7 +1006,19 @@ class GemmPrimitive(BasePrimitive):
             (lhs_non_cdims, lhs_cdims, rhs_non_cdims, rhs_cdims),
         )
 
-        if collective_op.is_none:
+        if infer_contracting_reduction_axes:
+            if not collective_op.is_none:
+                raise ValueError(
+                    "Contracting reduction-axis inference is supported only for "
+                    f"non-collective GEMM; got collective_op={collective_op}."
+                )
+            reduce_spec = _infer_contracting_reduction_spec(
+                lhs_cspecs,
+                rhs_cspecs,
+                lhs_non_cspecs,
+                rhs_non_cspecs,
+            )
+        elif collective_op.is_none:
             reduce_spec = _shared_contracting_spec(lhs_cspecs, rhs_cspecs)
         else:
             # Preserve CollectiveGEMM AG/RS behavior. The shared-axis
@@ -1154,6 +1210,7 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
         mesh,
         arg_infos,
         result_infos,
@@ -1172,6 +1229,7 @@ class GemmPrimitive(BasePrimitive):
             transpose_batch_sequence,
             collective_op,
             scaling_mode,
+            infer_contracting_reduction_axes,
         )
         out_sharding = NamedSharding(mesh, PartitionSpec(*out_specs))
 
@@ -1187,6 +1245,7 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
         mesh,
         arg_infos,
         result_infos,
@@ -1204,6 +1263,7 @@ class GemmPrimitive(BasePrimitive):
             transpose_batch_sequence,
             collective_op,
             scaling_mode,
+            infer_contracting_reduction_axes,
         )
 
         # Block scale inverses match their operands, but tensor scale inverses are unsharded.
@@ -1250,6 +1310,7 @@ class GemmPrimitive(BasePrimitive):
                 sequence_dim=inferred_sequence_dim,
                 is_outer=False,
                 collective_op=collective_op,
+                infer_contracting_reduction_axes=infer_contracting_reduction_axes,
             )
 
             if reduce_spec is not None:
@@ -1281,11 +1342,12 @@ class GemmPrimitive(BasePrimitive):
         sequence_dim,
         is_outer,
         collective_op,
+        infer_contracting_reduction_axes,
         mesh,
         operand_types,
         result_types,
     ):
-        del out_dtype, use_split_accumulator
+        del out_dtype, use_split_accumulator, infer_contracting_reduction_axes
         del mesh, result_types, transpose_batch_sequence, sequence_dim, is_outer
 
         if not collective_op.is_none:
@@ -1369,6 +1431,7 @@ def _te_gemm(
     use_split_accumulator: bool = False,
     transpose_batch_sequence: bool = False,
     collective_op: CollectiveOp = CollectiveOp.NONE,
+    infer_contracting_reduction_axes: bool = False,
 ) -> Tuple[jax.Array, ...]:
 
     # Prepare non-quantized GEMM operands
@@ -1461,6 +1524,7 @@ def _te_gemm(
         sequence_dim=-1,  #  Dummy value and will be set in the primitive
         is_outer=True,
         collective_op=collective_op,
+        infer_contracting_reduction_axes=infer_contracting_reduction_axes,
     )
     return output
 
@@ -2069,6 +2133,7 @@ def gemm(
     rhs_quantizer: Quantizer = None,
     transpose_batch_sequence: bool = False,
     collective_op: CollectiveOp = CollectiveOp.NONE,
+    infer_contracting_reduction_axes: bool = False,
     **kwargs,
 ) -> Tuple[jnp.ndarray, ...]:
     r"""General matrix multiplication with optional quantization.
@@ -2112,6 +2177,11 @@ def gemm(
             ``CUDA_ERROR_STREAM_CAPTURE_INVALIDATED``. Not required when
             ``collective_op`` is ``CollectiveOp.NONE`` or when using the Userbuffers
             backend instead of cuBLASMp.
+    infer_contracting_reduction_axes: bool, default = False
+        Infer mesh axes shared by the operands' contracting dimensions and sum
+        partial GEMM outputs over those axes. Dense enables this explicitly for
+        WGrad so quantized transpose/checkpoint dimension ordering cannot hide
+        required data-parallel reductions.
 
     Returns
     -------
@@ -2138,6 +2208,10 @@ def gemm(
     if not GemmPrimitive.enabled():
         if not collective_op.is_none:
             raise RuntimeError("JAX GEMM does not support collective GEMM")
+        if infer_contracting_reduction_axes:
+            raise RuntimeError(
+                "Contracting reduction-axis inference requires the TE GEMM custom partitioner"
+            )
         output = _jax_gemm(
             lhs, rhs, contracting_dims, lhs_quantizer, rhs_quantizer, use_split_accumulator
         )
@@ -2155,6 +2229,7 @@ def gemm(
         use_split_accumulator=use_split_accumulator,
         transpose_batch_sequence=transpose_batch_sequence,
         collective_op=collective_op,
+        infer_contracting_reduction_axes=infer_contracting_reduction_axes,
     )
 
     return output

@@ -172,8 +172,15 @@ class QuantizationTest(unittest.TestCase):
     maxtext_root = Path(__file__).parents[2]
     patch_path = maxtext_root / "src/maxtext/te_ep_mixed_rank_views.patch"
     overlay_ep_path = maxtext_root / "src/maxtext/te_overlay/transformer_engine/jax/ep.py"
+    overlay_dense_path = maxtext_root / "src/maxtext/te_overlay/transformer_engine/jax/dense.py"
+    overlay_gemm_path = (
+        maxtext_root
+        / "src/maxtext/te_overlay/transformer_engine/jax/cpp_extensions/gemm.py"
+    )
     patch_text = patch_path.read_text(encoding="utf-8")
     overlay_ep_text = overlay_ep_path.read_text(encoding="utf-8")
+    overlay_dense_text = overlay_dense_path.read_text(encoding="utf-8")
+    overlay_gemm_text = overlay_gemm_path.read_text(encoding="utf-8")
 
     self.assertNotIn("reduce_specs = []", patch_text)
     self.assertNotIn("def is_reduce_spec", patch_text)
@@ -183,6 +190,8 @@ class QuantizationTest(unittest.TestCase):
     self.assertIn("def _num_ep_output_groups", overlay_ep_text)
     self.assertIn("reduce_axes = reduce_spec if isinstance(reduce_spec, tuple)", patch_text)
     self.assertIn("for axis in reduce_axes:", patch_text)
+    self.assertIn("infer_contracting_reduction_axes=True", overlay_dense_text)
+    self.assertIn("def _infer_contracting_reduction_spec", overlay_gemm_text)
 
   def test_in_quant_mode(self):
     quant = _configure_quantization(quant_str="int8", mode_str="convert")
