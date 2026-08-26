@@ -53,6 +53,23 @@ def _pad_partition_spec(spec, ndim):
     return entries + (None,) * (ndim - len(entries))
 
 
+def _drop_unit_mesh_axes(spec, mesh_shape):
+    """Remove mesh axes of size one because they do not affect physical layout."""
+    cleaned = []
+    for entry in spec:
+        active_axes = []
+        for mesh_axis in _spec_axes(entry):
+            if mesh_axis not in mesh_shape:
+                raise ValueError(
+                    f"PartitionSpec references unknown mesh axis {mesh_axis!r}; "
+                    f"available axes are {tuple(mesh_shape)}."
+                )
+            if int(mesh_shape[mesh_axis]) > 1:
+                active_axes.append(mesh_axis)
+        cleaned.append(_axes_spec(active_axes))
+    return PartitionSpec(*cleaned)
+
+
 def _plan_local_wgrad_partition(
     lhs_spec,
     rhs_spec,
@@ -192,7 +209,8 @@ def _jax_bf16_wgrad_infer_sharding(
 ):
     """Use the parameter layout as the WGrad output layout."""
     del contracting_dims, arg_infos, result_infos
-    return NamedSharding(mesh, PartitionSpec(*output_spec))
+    active_output_spec = _drop_unit_mesh_axes(output_spec, mesh.shape)
+    return NamedSharding(mesh, active_output_spec)
 
 
 def _jax_bf16_wgrad_partition(
@@ -207,10 +225,13 @@ def _jax_bf16_wgrad_partition(
     result_info = (
         result_infos[0] if isinstance(result_infos, (tuple, list)) else result_infos
     )
+    lhs_spec = _drop_unit_mesh_axes(lhs_info.sharding.spec, mesh.shape)
+    rhs_spec = _drop_unit_mesh_axes(rhs_info.sharding.spec, mesh.shape)
+    active_output_spec = _drop_unit_mesh_axes(output_spec, mesh.shape)
     lhs_specs, rhs_specs, output_specs, reduction_plan = _plan_local_wgrad_partition(
-        lhs_info.sharding.spec,
-        rhs_info.sharding.spec,
-        output_spec,
+        lhs_spec,
+        rhs_spec,
+        active_output_spec,
         len(lhs_info.shape),
         len(rhs_info.shape),
         len(result_info.shape),

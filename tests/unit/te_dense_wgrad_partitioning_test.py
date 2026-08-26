@@ -16,6 +16,20 @@ dense = importlib.import_module("transformer_engine.jax.dense")
 
 class TeDenseWgradPartitioningTest(unittest.TestCase):
 
+  def test_unit_mesh_axes_do_not_affect_compound_kernel_layout(self):
+    spec = dense._drop_unit_mesh_axes(
+        PartitionSpec(("fsdp", "sequence", "tensor_transpose", "context", "expert"), None),
+        {
+            "fsdp": 2,
+            "sequence": 1,
+            "tensor_transpose": 1,
+            "context": 1,
+            "expert": 2,
+        },
+    )
+
+    self.assertEqual(spec, PartitionSpec(("fsdp", "expert"), None))
+
   def test_partial_compound_contracting_axes_gather_only_operand_difference(self):
     lhs_spec, rhs_spec, output_spec, reduction_plan = dense._plan_local_wgrad_partition(
         PartitionSpec(("fsdp", "tensor", "expert"), None),
