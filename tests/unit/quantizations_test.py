@@ -194,7 +194,12 @@ class QuantizationTest(unittest.TestCase):
     self.assertIn("preferred_element_type: jnp.dtype = None", overlay_gemm_text)
     self.assertIn('wgrad_backend: str = "te"', overlay_dense_text)
     self.assertIn('if wgrad_backend == "jax_bf16":', overlay_dense_text)
-    self.assertIn("wgrad = jax.lax.dot_general(", overlay_dense_text)
+    self.assertIn("_jax_bf16_wgrad = custom_partitioning(", overlay_dense_text)
+    self.assertIn("_jax_bf16_wgrad.def_partition(", overlay_dense_text)
+    self.assertIn("output = jax.lax.psum_scatter(", overlay_dense_text)
+    self.assertIn("output = jax.lax.psum(output, mesh_axis)", overlay_dense_text)
+    self.assertIn("kernel_pspec = _logical_to_partition_spec(kernel_axes)", overlay_dense_text)
+    self.assertIn("wgrad = _jax_bf16_wgrad(", overlay_dense_text)
     self.assertIn("wgrad_x.astype(jnp.bfloat16)", overlay_dense_text)
     self.assertIn("grad.astype(jnp.bfloat16)", overlay_dense_text)
     constraint_pos = overlay_dense_text.index(

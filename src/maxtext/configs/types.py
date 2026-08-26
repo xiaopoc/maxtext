@@ -441,8 +441,9 @@ class Quantization(BaseModel):
       TEWgradBackendType.TE,
       description=(
           "Backend for Transformer Engine Dense WGrad. 'te' preserves the FP8 TE path; "
-          "'jax_bf16' keeps TE FP8 forward and DGrad but computes WGrad from the original "
-          "BF16 activation and output gradient with JAX dot_general."
+          "'jax_bf16' keeps TE FP8 forward and DGrad but computes explicitly partitioned "
+          "local WGrad from the original BF16 activation and output gradient, with FP32 "
+          "accumulation and reduction into the kernel shard."
       ),
   )
   replicate_quant_scale: bool = Field(

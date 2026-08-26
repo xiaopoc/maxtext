@@ -14,6 +14,9 @@ from functools import partial
 import warnings
 import jax
 import jax.numpy as jnp
+from jax.experimental.custom_partitioning import custom_partitioning, SdyShardingRule
+from jax.sharding import NamedSharding, PartitionSpec
+from packaging.version import Version as PkgVersion
 
 from . import cpp_extensions as tex
 from .cpp_extensions.amax import AmaxScope
@@ -24,6 +27,265 @@ from .quantize import (
     with_sharding_constraint_by_logical_axes,
     TensorUsage,
 )
+
+
+def _spec_axes(spec):
+    """Normalize one PartitionSpec entry to an ordered tuple of mesh axes."""
+    if spec is None:
+        return ()
+    axes = spec if isinstance(spec, tuple) else (spec,)
+    return tuple(dict.fromkeys(axes))
+
+
+def _axes_spec(axes):
+    """Convert normalized mesh axes back to one PartitionSpec entry."""
+    axes = tuple(axes)
+    if not axes:
+        return None
+    return axes[0] if len(axes) == 1 else axes
+
+
+def _pad_partition_spec(spec, ndim):
+    """Pad a PartitionSpec with replicated dimensions to match an array rank."""
+    entries = tuple(spec)
+    if len(entries) > ndim:
+        raise ValueError(f"PartitionSpec rank {len(entries)} exceeds array rank {ndim}: {spec}")
+    return entries + (None,) * (ndim - len(entries))
+
+
+def _plan_local_wgrad_partition(
+    lhs_spec,
+    rhs_spec,
+    output_spec,
+    lhs_ndim,
+    rhs_ndim,
+    output_ndim,
+    contracting_dims,
+):
+    """Plan aligned local operands and explicit WGrad reductions.
+
+    The contracting dimension may be sharded by partially overlapping compound
+    mesh axes. Operand-only axes are removed from that dimension, which asks
+    GSPMD to gather only those axes before entering the local implementation.
+    Axes shared by both operands remain local contraction shards and are reduced
+    explicitly after the local dot. If a shared axis shards the kernel, the
+    reduction is a reduce-scatter into that kernel dimension; otherwise it is
+    an all-reduce.
+    """
+    lhs_cdims, rhs_cdims = contracting_dims
+    if len(lhs_cdims) != 1 or len(rhs_cdims) != 1:
+        raise NotImplementedError(
+            "Explicit local JAX WGrad currently requires exactly one flattened "
+            f"contracting dimension, got {contracting_dims}."
+        )
+
+    lhs_cdim, rhs_cdim = lhs_cdims[0], rhs_cdims[0]
+    lhs_specs = list(_pad_partition_spec(lhs_spec, lhs_ndim))
+    rhs_specs = list(_pad_partition_spec(rhs_spec, rhs_ndim))
+    output_specs = _pad_partition_spec(output_spec, output_ndim)
+    lhs_non_cdims = tuple(dim for dim in range(lhs_ndim) if dim != lhs_cdim)
+    rhs_non_cdims = tuple(dim for dim in range(rhs_ndim) if dim != rhs_cdim)
+    output_sources = tuple(("lhs", dim) for dim in lhs_non_cdims) + tuple(
+        ("rhs", dim) for dim in rhs_non_cdims
+    )
+    if len(output_sources) != output_ndim:
+        raise ValueError(
+            f"WGrad output rank {output_ndim} does not match dot output rank "
+            f"{len(output_sources)}."
+        )
+
+    lhs_axes = _spec_axes(lhs_specs[lhs_cdim])
+    rhs_axis_set = set(_spec_axes(rhs_specs[rhs_cdim]))
+    shared_axes = tuple(axis for axis in lhs_axes if axis in rhs_axis_set)
+    shared_spec = _axes_spec(shared_axes)
+
+    # Both local operands must contain the same slice of the contracting
+    # dimension. Removing operand-only axes materializes only the minimum
+    # alignment gather; shared axes stay sharded for the local partial dot.
+    lhs_specs[lhs_cdim] = shared_spec
+    rhs_specs[rhs_cdim] = shared_spec
+
+    # A non-reduction output axis must be carried by the corresponding local
+    # dot operand. Reduction axes are intentionally absent before the dot and
+    # are introduced into the result by psum_scatter below.
+    shared_axis_set = set(shared_axes)
+    for output_dim, (operand, operand_dim) in enumerate(output_sources):
+        output_axes = _spec_axes(output_specs[output_dim])
+        local_output_axes = tuple(axis for axis in output_axes if axis not in shared_axis_set)
+        reduction_output_axes = tuple(axis for axis in output_axes if axis in shared_axis_set)
+        if output_axes != local_output_axes + reduction_output_axes:
+            raise NotImplementedError(
+                "Explicit local JAX WGrad requires carrier mesh axes to precede "
+                "reduce-scatter axes within a compound kernel dimension, got "
+                f"{output_specs[output_dim]!r} on output dimension {output_dim}."
+            )
+        if operand == "lhs":
+            lhs_specs[operand_dim] = _axes_spec(local_output_axes)
+        else:
+            rhs_specs[operand_dim] = _axes_spec(local_output_axes)
+
+    reduction_plan = []
+    scattered_axes = set()
+    for output_dim, spec in enumerate(output_specs):
+        for mesh_axis in _spec_axes(spec):
+            if mesh_axis not in shared_axis_set:
+                continue
+            if mesh_axis in scattered_axes:
+                raise ValueError(
+                    f"Kernel PartitionSpec uses mesh axis {mesh_axis!r} on multiple dimensions: "
+                    f"{output_specs}"
+                )
+            reduction_plan.append((mesh_axis, output_dim))
+            scattered_axes.add(mesh_axis)
+
+    for mesh_axis in shared_axes:
+        if mesh_axis not in scattered_axes:
+            reduction_plan.append((mesh_axis, None))
+
+    return tuple(lhs_specs), tuple(rhs_specs), output_specs, tuple(reduction_plan)
+
+
+def _jax_bf16_wgrad_impl(lhs, rhs, contracting_dims, output_spec):
+    """Reference/global implementation used outside a partitioned mesh."""
+    del output_spec
+    return jax.lax.dot_general(
+        lhs,
+        rhs,
+        dimension_numbers=(contracting_dims, ((), ())),
+        precision=jax.lax.Precision.DEFAULT,
+        preferred_element_type=jnp.float32,
+    )
+
+
+_jax_bf16_wgrad = custom_partitioning(
+    _jax_bf16_wgrad_impl,
+    static_argnums=(2, 3),
+)
+
+
+def _jax_bf16_wgrad_shardy_rule(
+    contracting_dims,
+    output_spec,
+    mesh,
+    operand_types,
+    result_types,
+):
+    """Keep operand and result propagation independent; partition() owns communication."""
+    del contracting_dims, output_spec, mesh
+    lhs_type, rhs_type = operand_types
+    result_type = result_types[0] if isinstance(result_types, (tuple, list)) else result_types
+    lhs_mapping = tuple(f"Wgrad_lhs_{dim}" for dim in range(len(lhs_type.shape)))
+    rhs_mapping = tuple(f"Wgrad_rhs_{dim}" for dim in range(len(rhs_type.shape)))
+    output_mapping = tuple(f"Wgrad_out_{dim}" for dim in range(len(result_type.shape)))
+    return SdyShardingRule(
+        operand_mappings=(lhs_mapping, rhs_mapping),
+        result_mappings=(output_mapping,),
+    )
+
+
+def _jax_bf16_wgrad_infer_sharding(
+    contracting_dims,
+    output_spec,
+    mesh,
+    arg_infos,
+    result_infos,
+):
+    """Use the parameter layout as the WGrad output layout."""
+    del contracting_dims, arg_infos, result_infos
+    return NamedSharding(mesh, PartitionSpec(*output_spec))
+
+
+def _jax_bf16_wgrad_partition(
+    contracting_dims,
+    output_spec,
+    mesh,
+    arg_infos,
+    result_infos,
+):
+    """Lower WGrad to aligned local dot plus explicit reduction collectives."""
+    lhs_info, rhs_info = arg_infos
+    result_info = (
+        result_infos[0] if isinstance(result_infos, (tuple, list)) else result_infos
+    )
+    lhs_specs, rhs_specs, output_specs, reduction_plan = _plan_local_wgrad_partition(
+        lhs_info.sharding.spec,
+        rhs_info.sharding.spec,
+        output_spec,
+        len(lhs_info.shape),
+        len(rhs_info.shape),
+        len(result_info.shape),
+        contracting_dims,
+    )
+
+    lhs_sharding = NamedSharding(mesh, PartitionSpec(*lhs_specs))
+    rhs_sharding = NamedSharding(mesh, PartitionSpec(*rhs_specs))
+    output_sharding = NamedSharding(mesh, PartitionSpec(*output_specs))
+
+    def _sharded_impl(lhs, rhs):
+        output = _jax_bf16_wgrad_impl(lhs, rhs, contracting_dims, output_spec)
+        for mesh_axis, scatter_dimension in reduction_plan:
+            if scatter_dimension is None:
+                output = jax.lax.psum(output, mesh_axis)
+            else:
+                output = jax.lax.psum_scatter(
+                    output,
+                    mesh_axis,
+                    scatter_dimension=scatter_dimension,
+                    tiled=True,
+                )
+        return output
+
+    return mesh, _sharded_impl, output_sharding, (lhs_sharding, rhs_sharding)
+
+
+_wgrad_partition_kwargs = {
+    "partition": _jax_bf16_wgrad_partition,
+    "sharding_rule": _jax_bf16_wgrad_shardy_rule,
+}
+if PkgVersion(jax.__version__) <= PkgVersion("0.9.1"):
+    _wgrad_partition_kwargs["infer_sharding_from_operands"] = (
+        _jax_bf16_wgrad_infer_sharding
+    )
+_jax_bf16_wgrad.def_partition(**_wgrad_partition_kwargs)
+
+
+def _flatten_wgrad_contracting_dims(lhs, rhs, lhs_cdims, rhs_cdims):
+    """Flatten contiguous leading token dimensions for the local partitioner."""
+    expected_lhs = tuple(range(len(lhs_cdims)))
+    expected_rhs = tuple(range(len(rhs_cdims)))
+    if tuple(lhs_cdims) != expected_lhs or tuple(rhs_cdims) != expected_rhs:
+        raise NotImplementedError(
+            "Explicit local JAX WGrad requires leading contracting dimensions, got "
+            f"{(lhs_cdims, rhs_cdims)}."
+        )
+    if len(lhs_cdims) != len(rhs_cdims):
+        raise ValueError(
+            "WGrad operands must have the same number of token dimensions, got "
+            f"{(lhs_cdims, rhs_cdims)}."
+        )
+    if len(lhs_cdims) == 1:
+        return lhs, rhs, ((0,), (0,))
+
+    lhs = lhs.reshape((-1, *lhs.shape[len(lhs_cdims) :]))
+    rhs = rhs.reshape((-1, *rhs.shape[len(rhs_cdims) :]))
+    return lhs, rhs, ((0,), (0,))
+
+
+def _logical_to_partition_spec(logical_axes):
+    """Resolve MaxText logical kernel axes while the axis-rules context is active."""
+    if not logical_axes:
+        raise ValueError(
+            "te_wgrad_backend=jax_bf16 requires kernel logical axes so its explicit "
+            "local WGrad partitioner can place the reduced gradient."
+        )
+
+    import flax  # pylint: disable=import-outside-toplevel
+
+    if not flax.linen.get_logical_axis_rules():
+        raise ValueError(
+            "te_wgrad_backend=jax_bf16 requires an active Flax logical_axis_rules context."
+        )
+    return flax.linen.logical_to_mesh_axes(logical_axes)
 
 
 def _all_gather_kernel(kernel, mesh_axis, axis_idx):
@@ -321,15 +583,18 @@ def _dense_bwd_rule(
     )
 
     if wgrad_backend == "jax_bf16":
-        wgrad = jax.lax.dot_general(
+        kernel_pspec = _logical_to_partition_spec(kernel_axes)
+        wgrad_lhs, wgrad_rhs, wgrad_contracting_dims = _flatten_wgrad_contracting_dims(
             wgrad_x.astype(jnp.bfloat16),
             grad.astype(jnp.bfloat16),
-            dimension_numbers=(
-                (x_contracting_dim, g_contracting_dim),
-                ((), ()),
-            ),
-            precision=jax.lax.Precision.DEFAULT,
-            preferred_element_type=jnp.float32,
+            x_contracting_dim,
+            g_contracting_dim,
+        )
+        wgrad = _jax_bf16_wgrad(
+            wgrad_lhs,
+            wgrad_rhs,
+            wgrad_contracting_dims,
+            kernel_pspec,
         )
     else:
         wgrad = tex.gemm(
@@ -341,9 +606,8 @@ def _dense_bwd_rule(
         )
 
     dgrad = with_sharding_constraint_by_logical_axes(dgrad, input_axes)
-    # Constrain the FP32 WGrad result to the parameter layout before casting.
-    # This lets GSPMD lower the JAX backend's token-shard reduction directly
-    # into the kernel shard instead of materializing a global-token operand.
+    # The JAX backend already returns the explicit parameter shard. Keep the
+    # logical constraint as a consistency check before casting to kernel dtype.
     wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
     wgrad = wgrad.astype(kernel_dtype_ref.dtype)
 

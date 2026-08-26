@@ -117,7 +117,8 @@ dtype: "bfloat16"
 # 'fp8_full' for fp8 quantization with static scaling.
 quantization: ""
 # Dense WGrad backend for Transformer Engine quantization. "jax_bf16" keeps
-# TE FP8 forward/DGrad and replaces only WGrad with JAX BF16 dot_general.
+# TE FP8 forward/DGrad and uses explicitly partitioned local BF16 WGrad with
+# FP32 accumulation and reduction into the kernel shard.
 te_wgrad_backend: "te"
 # used to configure constant_bound_config in aqt lib for static scaling, e.g. constant_bound_config='0.5, 0.5, 0.5, 0.5, 0.5, 0.5'
 constant_bound_config: ""
