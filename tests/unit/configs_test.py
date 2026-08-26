@@ -179,6 +179,23 @@ def test_compound_te_ep_supports_outer_fsdp():
   assert config.ici_fsdp_parallelism == 2
 
 
+def test_jax_bf16_wgrad_requires_te_fp8_quantization():
+  default_config = _compound_te_ep_config()
+  assert default_config.te_wgrad_backend.value == "te"
+
+  config = _compound_te_ep_config(
+      quantization="te_fp8_currentscaling",
+      te_wgrad_backend="jax_bf16",
+  )
+  assert config.te_wgrad_backend.value == "jax_bf16"
+
+  with pytest.raises(ValueError, match="requires quantization=te_fp8"):
+    _compound_te_ep_config(
+        quantization="",
+        te_wgrad_backend="jax_bf16",
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [

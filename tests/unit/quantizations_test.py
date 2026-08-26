@@ -192,12 +192,26 @@ class QuantizationTest(unittest.TestCase):
     self.assertIn("for axis in reduce_axes:", patch_text)
     self.assertIn("preferred_element_type=jnp.float32", overlay_dense_text)
     self.assertIn("preferred_element_type: jnp.dtype = None", overlay_gemm_text)
+    self.assertIn('wgrad_backend: str = "te"', overlay_dense_text)
+    self.assertIn('if wgrad_backend == "jax_bf16":', overlay_dense_text)
+    self.assertIn("wgrad = jax.lax.dot_general(", overlay_dense_text)
+    self.assertIn("wgrad_x.astype(jnp.bfloat16)", overlay_dense_text)
+    self.assertIn("grad.astype(jnp.bfloat16)", overlay_dense_text)
     constraint_pos = overlay_dense_text.index(
         "wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)"
     )
     cast_pos = overlay_dense_text.index("wgrad = wgrad.astype(kernel_dtype_ref.dtype)")
     self.assertLess(constraint_pos, cast_pos)
     self.assertNotIn("infer_contracting_reduction_axes", overlay_dense_text)
+
+    quantization_text = (
+        maxtext_root / "src/maxtext/layers/quantizations.py"
+    ).read_text(encoding="utf-8")
+    self.assertIn(
+        'kernel_axes=(mesh_axes or None) if wgrad_backend == "jax_bf16" else None',
+        quantization_text,
+    )
+    self.assertIn("wgrad_backend=wgrad_backend", quantization_text)
 
   def test_in_quant_mode(self):
     quant = _configure_quantization(quant_str="int8", mode_str="convert")

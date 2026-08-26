@@ -106,6 +106,14 @@ class TEGroupedGemmQuantizationType(str, Enum):
     TE_NO_QUANT = "te_no_quant" # Default precision, e.g. BF16, without quantization
     TE_MXFP8 = "te_mxfp8"
 
+
+class TEWgradBackendType(str, Enum):
+  """Supported backends for Transformer Engine Dense WGrad."""
+
+  TE = "te"
+  JAX_BF16 = "jax_bf16"
+
+
 class KvQuantAxis(str, Enum):
   """Axes to quantize over for the Key-Value cache."""
 
@@ -428,6 +436,14 @@ class Quantization(BaseModel):
   quantization: None | QuantizationType = Field(
       QuantizationType.NONE,
       description="Activates quantization for transformer layers.",
+  )
+  te_wgrad_backend: TEWgradBackendType = Field(
+      TEWgradBackendType.TE,
+      description=(
+          "Backend for Transformer Engine Dense WGrad. 'te' preserves the FP8 TE path; "
+          "'jax_bf16' keeps TE FP8 forward and DGrad but computes WGrad from the original "
+          "BF16 activation and output gradient with JAX dot_general."
+      ),
   )
   replicate_quant_scale: bool = Field(
       False,
@@ -2341,6 +2357,15 @@ class MaxTextConfig(
     Computes all derived values and runs all cross-field validations after initial parsing.
     This logic is ported from the legacy pyconfig_deprecated.py system and adapted for Pydantic.
     """
+    if self.te_wgrad_backend == TEWgradBackendType.JAX_BF16 and self.quantization not in (
+        QuantizationType.TE_FP8_DS,
+        QuantizationType.TE_FP8_CS,
+    ):
+      raise ValueError(
+          "te_wgrad_backend=jax_bf16 requires quantization=te_fp8_delayedscaling "
+          "or te_fp8_currentscaling."
+      )
+
     if self.custom_mesh_and_rule:
       custom_mesh_path = os.path.join(
           os.path.dirname(os.path.abspath(__file__)),

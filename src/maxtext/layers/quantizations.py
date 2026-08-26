@@ -860,21 +860,23 @@ class TransformerEngineQuantization(Quantization):
       raise ValueError(f"Invalid TransformerEngine quantization config: {config.quantization}")
 
     self._recipe = TransformerEngineQuantization._get_recipe(config.quantization)
+    self._wgrad_backend = getattr(config.te_wgrad_backend, "value", config.te_wgrad_backend)
     self._flatten_etp1_token_dims = bool(
         getattr(config, "use_te_ep", False)
         and int(getattr(config, "te_ep_expert_tensor_parallelism", 0)) == 1
     )
 
   def __hash__(self):
-    return hash((self.quant_mode, self._recipe, self._flatten_etp1_token_dims))
+    return hash((self.quant_mode, self._recipe, self._flatten_etp1_token_dims, self._wgrad_backend))
 
   def __eq__(self, other):
     if not isinstance(other, TransformerEngineQuantization):
       return False
-    return (self.quant_mode, self._recipe, self._flatten_etp1_token_dims) == (
+    return (self.quant_mode, self._recipe, self._flatten_etp1_token_dims, self._wgrad_backend) == (
         other.quant_mode,
         other._recipe,
         other._flatten_etp1_token_dims,
+        other._wgrad_backend,
     )
 
   @staticmethod
@@ -963,6 +965,7 @@ class TransformerEngineQuantization(Quantization):
     import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
     flatten_etp1_token_dims = self._flatten_etp1_token_dims
+    wgrad_backend = self._wgrad_backend
 
     def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
       contracting_dims, batch_dims = dims
@@ -977,7 +980,9 @@ class TransformerEngineQuantization(Quantization):
           x,
           kernel,
           contracting_dims=contracting_dims,
+          kernel_axes=(mesh_axes or None) if wgrad_backend == "jax_bf16" else None,
           quantizer_set=quantizer_set,
+          wgrad_backend=wgrad_backend,
       )
       if leading_shape is not None:
         output = output.reshape((*leading_shape, *output.shape[1:]))

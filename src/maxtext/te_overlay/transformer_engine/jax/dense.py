@@ -65,6 +65,7 @@ def dense(
     output_axes: Tuple[str, ...] = None,
     collective_op_set: tex.CollectiveOpSet = tex.noop_collective_op_set,
     quantizer_set: QuantizerSet = noop_quantizer_set,
+    wgrad_backend: str = "te",
 ):
     """Perform dense layer transformation with optional quantization.
 
@@ -83,10 +84,17 @@ def dense(
         output_axes: Logical axes for sharding the output
         collective_op_set: A set of CollectiveOp objects for forward and backward passes.
         quantizer_set: QuantizerSet which contains quantizers for different tensor types
+        wgrad_backend: ``"te"`` for the standard TE WGrad, or ``"jax_bf16"`` to
+            compute only WGrad with JAX BF16 dot_general.
 
     Returns:
         Transformed output tensor
     """
+    if wgrad_backend not in ("te", "jax_bf16"):
+        raise ValueError(
+            f"Unsupported Dense WGrad backend {wgrad_backend!r}; expected 'te' or 'jax_bf16'."
+        )
+
     if transpose_batch_sequence:
         warnings.warn("transpose_batch_sequence is not well tested, use with caution!")
 
@@ -111,12 +119,13 @@ def dense(
         kernel_axes,
         output_axes,
         collective_op_set,
+        wgrad_backend,
         quantizer_set,
     )
     return output
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8))
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6, 7, 8, 9))
 def _dense(
     x,
     kernel,
@@ -127,6 +136,7 @@ def _dense(
     kernel_axes,
     output_axes,
     collective_op_set,
+    wgrad_backend,
     quantizer_set,  # need to be a diff_arg for DelayedScaling state management
 ):
     """Internal implementation of dense layer transformation with custom VJP.
@@ -144,6 +154,7 @@ def _dense(
         output_axes: Logical axes for sharding the output_axes
         kernel_axes: Logical axes for sharding the weight matrix
         collective_op_set: A set of CollectiveOp objects for forward and backward passes.
+        wgrad_backend: Backend used only for WGrad.
         quantizer_set: QuantizerSet which contains quantizers for different tensor types
 
     Returns:
@@ -159,6 +170,7 @@ def _dense(
         kernel_axes,
         output_axes,
         collective_op_set,
+        wgrad_backend,
         quantizer_set,
     )
     return output
@@ -174,6 +186,7 @@ def _dense_fwd_rule(
     kernel_axes,
     output_axes,
     collective_op_set,
+    wgrad_backend,
     quantizer_set,
 ):
     """Forward pass rule for dense layer transformation.
@@ -224,8 +237,13 @@ def _dense_fwd_rule(
     output = with_sharding_constraint_by_logical_axes(output, output_axes)
 
     has_bias = bias is not None
+    wgrad_x = (
+        x
+        if wgrad_backend == "jax_bf16"
+        else casted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(quantizer_set.x)
+    )
     ctx = (
-        casted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(quantizer_set.x),
+        wgrad_x,
         casted_kernel.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(quantizer_set.kernel),
         jnp.zeros((), dtype=kernel.dtype),
         x.shape,
@@ -244,6 +262,7 @@ def _dense_bwd_rule(
     kernel_axes,
     output_axes,
     collective_op_set,
+    wgrad_backend,
     ctx,
     grad,
 ):
@@ -253,7 +272,7 @@ def _dense_bwd_rule(
         Tuple of gradients with respect to inputs
     """
     (
-        casted_x_lhs,
+        wgrad_x,
         casted_kernel_rhs,
         kernel_dtype_ref,
         x_shape,
@@ -265,7 +284,7 @@ def _dense_bwd_rule(
     grad = with_sharding_constraint_by_logical_axes(grad, output_axes)
 
     fwd_x_contracting_dims, fwd_k_contracting_dims = map(
-        tex.sanitize_dims, (casted_x_lhs.ndim, casted_kernel_rhs.ndim), contracting_dims
+        tex.sanitize_dims, (wgrad_x.ndim, casted_kernel_rhs.ndim), contracting_dims
     )
 
     casted_grad, dbias = tex.quantize_dbias(
@@ -301,19 +320,30 @@ def _dense_bwd_rule(
         range(0, len(x_shape) - len(fwd_x_contracting_dims))
     )
 
-    wgrad = tex.gemm(
-        casted_x_lhs,
-        casted_grad.get_tensor(usage=TensorUsage.RHS),
-        contracting_dims=(x_contracting_dim, g_contracting_dim),
-        transpose_batch_sequence=transpose_batch_sequence,
-        preferred_element_type=jnp.float32,
-    )
+    if wgrad_backend == "jax_bf16":
+        wgrad = jax.lax.dot_general(
+            wgrad_x.astype(jnp.bfloat16),
+            grad.astype(jnp.bfloat16),
+            dimension_numbers=(
+                (x_contracting_dim, g_contracting_dim),
+                ((), ()),
+            ),
+            precision=jax.lax.Precision.DEFAULT,
+            preferred_element_type=jnp.float32,
+        )
+    else:
+        wgrad = tex.gemm(
+            wgrad_x,
+            casted_grad.get_tensor(usage=TensorUsage.RHS),
+            contracting_dims=(x_contracting_dim, g_contracting_dim),
+            transpose_batch_sequence=transpose_batch_sequence,
+            preferred_element_type=jnp.float32,
+        )
 
     dgrad = with_sharding_constraint_by_logical_axes(dgrad, input_axes)
-    # Keep local FP8 GEMM outputs and the SPMD-generated FSDP/EP
-    # reduce-scatter in FP32. Casting a local partial to BF16 before the
-    # reduction changes the accumulation semantics relative to the original
-    # global-contracting-dimension GEMM.
+    # Constrain the FP32 WGrad result to the parameter layout before casting.
+    # This lets GSPMD lower the JAX backend's token-shard reduction directly
+    # into the kernel shard instead of materializing a global-token operand.
     wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
     wgrad = wgrad.astype(kernel_dtype_ref.dtype)
 
