@@ -12,13 +12,12 @@ import unittest
 
 gemm = importlib.import_module("transformer_engine.jax.cpp_extensions.gemm")
 
-
 class TeGemmPartitioningTest(unittest.TestCase):
 
-  def test_wgrad_reduction_flag_reaches_default_shardy_callback(self):
-    parameters = inspect.signature(gemm.GemmPrimitive.shardy_sharding_rule).parameters
-    self.assertIn("infer_contracting_reduction_axes", parameters)
-    self.assertIn(15, gemm.GemmPrimitive.impl_static_args)
+  def test_gemm_accepts_preferred_output_dtype_for_fp8_wgrad(self):
+    self.assertIn("preferred_element_type", inspect.signature(gemm.gemm).parameters)
+    self.assertIn("preferred_element_type", inspect.signature(gemm._te_gemm).parameters)
+    self.assertIn("preferred_element_type", inspect.signature(gemm._jax_gemm).parameters)
 
   def test_scalar_contracting_spec(self):
     self.assertEqual(gemm._shared_contracting_spec(("tensor",), ("tensor",)), "tensor")
@@ -75,39 +74,6 @@ class TeGemmPartitioningTest(unittest.TestCase):
             (("fsdp", "tensor", "tensor"),),
         ),
         ("tensor", "fsdp"),
-    )
-
-  def test_wgrad_reduction_axes_survive_contracting_dimension_reordering(self):
-    self.assertEqual(
-        gemm._infer_contracting_reduction_spec(
-            (("expert", "fsdp"), None),
-            (None, ("expert", "fsdp")),
-            ("tensor",),
-            (None,),
-        ),
-        ("expert", "fsdp"),
-    )
-
-  def test_wgrad_reduction_excludes_output_sharding_axis(self):
-    self.assertEqual(
-        gemm._infer_contracting_reduction_spec(
-            (("expert", "fsdp", "tensor"),),
-            (("expert", "fsdp", "tensor"),),
-            ("tensor",),
-            (None,),
-        ),
-        ("expert", "fsdp"),
-    )
-
-  def test_wgrad_reduction_ignores_axes_not_shared_by_both_operands(self):
-    self.assertEqual(
-        gemm._infer_contracting_reduction_spec(
-            (("expert", "fsdp"),),
-            (("expert", "tensor"),),
-            (None,),
-            ("tensor",),
-        ),
-        "expert",
     )
 
 

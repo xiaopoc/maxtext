@@ -190,8 +190,14 @@ class QuantizationTest(unittest.TestCase):
     self.assertIn("def _num_ep_output_groups", overlay_ep_text)
     self.assertIn("reduce_axes = reduce_spec if isinstance(reduce_spec, tuple)", patch_text)
     self.assertIn("for axis in reduce_axes:", patch_text)
-    self.assertIn("infer_contracting_reduction_axes=True", overlay_dense_text)
-    self.assertIn("def _infer_contracting_reduction_spec", overlay_gemm_text)
+    self.assertIn("preferred_element_type=jnp.float32", overlay_dense_text)
+    self.assertIn("preferred_element_type: jnp.dtype = None", overlay_gemm_text)
+    constraint_pos = overlay_dense_text.index(
+        "wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)"
+    )
+    cast_pos = overlay_dense_text.index("wgrad = wgrad.astype(kernel_dtype_ref.dtype)")
+    self.assertLess(constraint_pos, cast_pos)
+    self.assertNotIn("infer_contracting_reduction_axes", overlay_dense_text)
 
   def test_in_quant_mode(self):
     quant = _configure_quantization(quant_str="int8", mode_str="convert")

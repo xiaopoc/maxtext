@@ -227,6 +227,7 @@ def _dense_fwd_rule(
     ctx = (
         casted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(quantizer_set.x),
         casted_kernel.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(quantizer_set.kernel),
+        jnp.zeros((), dtype=kernel.dtype),
         x.shape,
         kernel.shape,
         quantizer_set,
@@ -254,6 +255,7 @@ def _dense_bwd_rule(
     (
         casted_x_lhs,
         casted_kernel_rhs,
+        kernel_dtype_ref,
         x_shape,
         kernel_shape,
         quantizer_set,
@@ -304,11 +306,16 @@ def _dense_bwd_rule(
         casted_grad.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=(x_contracting_dim, g_contracting_dim),
         transpose_batch_sequence=transpose_batch_sequence,
-        infer_contracting_reduction_axes=True,
+        preferred_element_type=jnp.float32,
     )
 
     dgrad = with_sharding_constraint_by_logical_axes(dgrad, input_axes)
+    # Keep local FP8 GEMM outputs and the SPMD-generated FSDP/EP
+    # reduce-scatter in FP32. Casting a local partial to BF16 before the
+    # reduction changes the accumulation semantics relative to the original
+    # global-contracting-dimension GEMM.
     wgrad = with_sharding_constraint_by_logical_axes(wgrad, kernel_axes)
+    wgrad = wgrad.astype(kernel_dtype_ref.dtype)
 
     return dgrad, wgrad, dbias, quantizer_set
 
